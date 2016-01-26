@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015, The CyanogenMod Project
+ * Copyright (C) 2016, The CyanogenMod Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 *
 */
 
+//#define LOG_NDEBUG 0
 #define LOG_TAG "CameraWrapper"
 #include <cutils/log.h>
 #include <cutils/properties.h>
@@ -35,6 +36,8 @@
 #define BACK_CAMERA     0
 #define FRONT_CAMERA    1
 
+using namespace android;
+
 enum {
     UNKNOWN = -1,
     FALCON,
@@ -45,7 +48,7 @@ enum {
 
 static int product_device = UNKNOWN;
 
-static android::Mutex gCameraWrapperLock;
+static Mutex gCameraWrapperLock;
 static camera_module_t *gVendorModule = 0;
 
 static char **fixed_set_params = NULL;
@@ -80,7 +83,6 @@ camera_module_t HAL_MODULE_INFO_SYM = {
     .init = NULL, /* remove compilation warnings */
     .reserved = {0}, /* remove compilation warnings */
 };
-
 
 static int get_product_device()
 {
@@ -134,37 +136,58 @@ static int check_vendor_module()
 
 static char *camera_fixup_getparams(int id, const char *settings)
 {
-    int device = get_product_device();
-    android::CameraParameters params;
-    params.unflatten(android::String8(settings));
+    CameraParameters params;
+    params.unflatten(String8(settings));
 
 #if !LOG_NDEBUG
     ALOGV("%s: original parameters:", __FUNCTION__);
     params.dump();
 #endif
 
-    if (id == FRONT_CAMERA) {
-        if (device == FALCON || device == PEREGRINE) {
-            params.set(android::CameraParameters::KEY_MAX_EXPOSURE_COMPENSATION, 0);
-            params.set(android::CameraParameters::KEY_MAX_NUM_METERING_AREAS, 0);
-            params.set(android::CameraParameters::KEY_MIN_EXPOSURE_COMPENSATION, 0);
-            params.set(android::CameraParameters::KEY_SUPPORTED_ANTIBANDING,
-                android::CameraParameters::ANTIBANDING_AUTO);
-            params.set(android::CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE,
-                "(15000,15000),(15000,30000)");
-            params.set(android::CameraParameters::KEY_SUPPORTED_SCENE_MODES,
-                android::CameraParameters::SCENE_MODE_AUTO);
-            params.set(android::CameraParameters::KEY_SUPPORTED_WHITE_BALANCE,
-                android::CameraParameters::WHITE_BALANCE_AUTO);
-            params.set(android::CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, 0);
+#if !LOG_NDEBUG
+    ALOGV("%s: fixed parameters:", __FUNCTION__);
+    params.dump();
+#endif
 
+    String8 strParams = params.flatten();
+    char *ret = strdup(strParams.string());
+
+    return ret;
+}
+
+static char *camera_fixup_setparams(int id, const char *settings)
+{
+    CameraParameters params;
+    params.unflatten(String8(settings));
+
+#if !LOG_NDEBUG
+    ALOGV("%s: original parameters:", __FUNCTION__);
+    params.dump();
+#endif
+
+    if (get_product_device() == FALCON || get_product_device() == PEREGRINE) {
+        if (id == BACK_CAMERA) {
+            /*
+             * In some cases the vendor HAL tries to restore an invalid fps range
+             * (10000,15000) causing a crash.
+             */
+            const char *fps = params.get(CameraParameters::KEY_PREVIEW_FPS_RANGE);
+            const char *fpsValues = params.get(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE);
+            if (fps != NULL && fpsValues != NULL) {
+                if (!strstr(fpsValues, fps, strlen(fps))) {
+                    params.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "15000,30000");
+                }
+            }
+        } else {
             /* The HW detection causes a stream of errors, disable it. */
             params.set(android::CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW, 0);
         }
-    } else if (id == BACK_CAMERA) {
-        if (device == FALCON || device == PEREGRINE) {
-            params.set(android::CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE,
-                "(15000,15000),(15000,30000)");
+    } else if (get_product_device() == TITAN || get_product_device() == THEA) {
+        const char *sceneMode = params.get(CameraParameters::KEY_SCENE_MODE);
+        if (sceneMode != NULL) {
+            if (!strcmp(sceneMode, CameraParameters::SCENE_MODE_HDR)) {
+                params.remove(CameraParameters::KEY_ZSL);
+            }
         }
     }
 
@@ -173,28 +196,7 @@ static char *camera_fixup_getparams(int id, const char *settings)
     params.dump();
 #endif
 
-    android::String8 strParams = params.flatten();
-    char *ret = strdup(strParams.string());
-
-    return ret;
-}
-
-static char *camera_fixup_setparams(int id, const char *settings)
-{
-    android::CameraParameters params;
-    params.unflatten(android::String8(settings));
-
-#if !LOG_NDEBUG
-    ALOGV("%s: original parameters:", __FUNCTION__);
-    params.dump();
-#endif
-
-#if !LOG_NDEBUG
-    ALOGV("%s: fixed parameters:", __FUNCTION__);
-    params.dump();
-#endif
-
-    android::String8 strParams = params.flatten();
+    String8 strParams = params.flatten();
     if (fixed_set_params[id])
         free(fixed_set_params[id]);
     fixed_set_params[id] = strdup(strParams.string());
@@ -370,7 +372,6 @@ static int camera_auto_focus(struct camera_device *device)
     if (!device)
         return -EINVAL;
 
-
     return VENDOR_CALL(device, auto_focus);
 }
 
@@ -436,7 +437,6 @@ static char *camera_get_parameters(struct camera_device *device)
     char *tmp = camera_fixup_getparams(CAMERA_ID(device), params);
     VENDOR_CALL(device, put_parameters, params);
     params = tmp;
-
     return params;
 }
 
@@ -492,7 +492,7 @@ static int camera_device_close(hw_device_t *device)
 
     ALOGV("%s", __FUNCTION__);
 
-    android::Mutex::Autolock lock(gCameraWrapperLock);
+    Mutex::Autolock lock(gCameraWrapperLock);
 
     if (!device) {
         ret = -EINVAL;
@@ -536,7 +536,7 @@ static int camera_device_open(const hw_module_t *module, const char *name,
     wrapper_camera_device_t *camera_device = NULL;
     camera_device_ops_t *camera_ops = NULL;
 
-    android::Mutex::Autolock lock(gCameraWrapperLock);
+    Mutex::Autolock lock(gCameraWrapperLock);
 
     ALOGV("%s", __FUNCTION__);
 
